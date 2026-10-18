@@ -71,13 +71,16 @@ class ChromaService:
         query_embedding: list[float],
         k: int,
         document_id: str | None = None,
+        contains: str | None = None,
     ) -> list[tuple[Document, float]]:
         """Return the k chunks nearest to query_embedding, as (Document, distance).
 
         distance is cosine distance (collection uses hnsw:space=cosine), so
         smaller = more similar. Results are ordered nearest first.
+        `contains` limits the search to chunks whose text includes that string.
         """
         where = {"document_id": document_id} if document_id else None
+        where_document = {"$contains": contains} if contains else None
         try:
             if self.collection.count() == 0:
                 return []
@@ -85,6 +88,7 @@ class ChromaService:
                 query_embeddings=[query_embedding],
                 n_results=k,
                 where=where,
+                where_document=where_document,
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as exc:

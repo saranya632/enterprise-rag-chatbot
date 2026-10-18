@@ -12,6 +12,7 @@ ChromaDB only retrieves text. The reranker only reorders it. Qwen only writes
 the answer from the chunks that survive.
 """
 import logging
+import re
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -19,9 +20,18 @@ from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from pydantic import ConfigDict
 
+from app.services.llm_service import NOT_AVAILABLE
 from app.services.reranker_service import RerankerError
 
 logger = logging.getLogger(__name__)
+
+# "what is my mailid?", "my mail", "email address", "contact details" ... An
+# address like name@gmail.com shares almost no meaning with such a question,
+# so vector search alone ranks the chunk that holds it too low (or cuts it off).
+_EMAIL_QUESTION = re.compile(r"\b(e-?mail|mail|gmail|contact)(\s*ids?)?\b", re.IGNORECASE)
+_EMAIL_ADDRESS = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+# Extra chunks fetched for an email question, on top of the vector-search ones.
+EMAIL_CHUNKS_K = 2
 
 
 class NoRelevantDocumentsError(Exception):
@@ -54,13 +64,32 @@ class ChromaRetriever(BaseRetriever):
         query_vector = self.generate_query_embedding(query)
         results = self.chroma_service.query(query_vector, self.k, self.document_id)
 
-        documents = []
+        documents, seen = [], set()
         for document, distance in results:
             if self.max_distance is not None and distance > self.max_distance:
                 continue
             document.metadata["distance"] = distance
             documents.append(document)
+            seen.add(_chunk_key(document))
+
+        if _EMAIL_QUESTION.search(query):
+            # Chunks that actually contain an address, exempt from the distance
+            # cutoff: the text match already proves they are relevant.
+            matches = self.chroma_service.query(
+                query_vector, EMAIL_CHUNKS_K, self.document_id, contains="@"
+            )
+            for document, distance in matches:
+                if _chunk_key(document) in seen or not _EMAIL_ADDRESS.search(document.page_content):
+                    continue
+                document.metadata["distance"] = distance
+                document.metadata["keyword_match"] = True
+                documents.append(document)
+                seen.add(_chunk_key(document))
         return documents
+
+
+def _chunk_key(document: Document) -> tuple:
+    return document.metadata.get("document_id"), document.metadata.get("chunk_index")
 
 
 class RAGService:
@@ -110,22 +139,29 @@ class RAGService:
 
     # --- Step 2: reranking ------------------------------------------------------
     def rerank_documents(self, question: str, documents: list[Document]) -> list[Document]:
-        """Keep the RERANK_TOP_K candidates the reranker scores as most relevant."""
-        if self.reranker is None:
-            return documents[: self.rerank_top_k]
+        """Keep the RERANK_TOP_K candidates the reranker scores as most relevant.
+
+        Keyword-matched chunks (see ChromaRetriever) always stay: the reranker
+        scores "mail id" against an address as poorly as vector search does.
+        """
+        pinned = [d for d in documents if d.metadata.get("keyword_match")][: self.rerank_top_k]
+        documents = [d for d in documents if not d.metadata.get("keyword_match")]
+        slots = self.rerank_top_k - len(pinned)
+        if self.reranker is None or not documents or slots == 0:
+            return pinned + documents[:slots]
         try:
-            ranked = self.reranker.rerank(question, documents, self.rerank_top_k)
+            ranked = self.reranker.rerank(question, documents, slots)
         except RerankerError:
             # Still answer, just with ChromaDB's order, rather than fail /chat.
             logger.exception("Reranking failed; falling back to vector-search order")
-            return documents[: self.rerank_top_k]
+            return pinned + documents[:slots]
         logger.info(
             "Reranking complete candidates=%d kept=%d scores=%s chunk_indexes=%s",
             len(documents), len(ranked),
             [round(d.metadata["rerank_score"], 3) for d in ranked],
             [d.metadata.get("chunk_index") for d in ranked],
         )
-        return ranked
+        return pinned + ranked
 
     # --- Step 3: context --------------------------------------------------------
     @staticmethod
@@ -174,5 +210,38 @@ class RAGService:
         # Step 4: generation. Qwen only sees the top-ranked text; it has no
         # access to ChromaDB itself.
         answer = self.llm_service.generate_answer(question, context)
+        answer = self.check_grounding(question, answer, documents)
 
         return {"answer": answer, "sources": self.build_sources(documents)}
+
+    @staticmethod
+    def check_grounding(question: str, answer: str, documents: list[Document]) -> str:
+        """Make sure every email address in the answer is copied exactly from the context.
+
+        Small models ignore "do not invent information": they make up plausible
+        addresses (e.g. test@gmail.com), or garble the real one while copying
+        it (saranya.m.s@gmail.com). For an email question whose context holds
+        an address, the answer is then rebuilt from the chunk text itself;
+        otherwise it becomes NOT_AVAILABLE.
+        """
+        # address (lowercase) -> (address as written, [Source N] it came from)
+        found = {}
+        for number, document in enumerate(documents, start=1):
+            for address in _EMAIL_ADDRESS.findall(document.page_content):
+                found.setdefault(address.lower(), (address, number))
+
+        in_answer = {a.lower() for a in _EMAIL_ADDRESS.findall(answer)}
+        invented = in_answer - found.keys()
+        if not invented and (in_answer or not _EMAIL_QUESTION.search(question)):
+            return answer
+
+        logger.warning(
+            "Answer replaced: %d email address(es) not in the context, %d in the context",
+            len(invented), len(found),
+        )
+        if not found or not _EMAIL_QUESTION.search(question):
+            return NOT_AVAILABLE
+        listed = ", ".join(f"{address} [Source {number}]" for address, number in found.values())
+        if len(found) == 1:
+            return f"The email address in the uploaded documents is {listed}."
+        return f"The email addresses in the uploaded documents are: {listed}."

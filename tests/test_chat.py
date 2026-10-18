@@ -5,6 +5,7 @@ from ollama import ResponseError
 
 from app.services import ChromaQueryError, LLMService, RerankerError
 from tests.conftest import authenticated_client, fake_reranker, make_test_app, upload
+from tests.pdf_factory import make_pdf
 
 
 class RecordingFakeLLM(FakeListChatModel):
@@ -235,6 +236,58 @@ def test_distance_cutoff_can_exclude_everything(tmp_path, chroma_service, embedd
     upload(client, sample_pdf_bytes)
 
     assert ask(client, question="procedure?").status_code == 404
+
+
+def _cv_pdf():
+    """A long PDF whose one contact line is easy for vector search to miss."""
+    filler = [f"Project {i}: tested solar inverter firmware and battery storage." for i in range(40)]
+    return make_pdf([filler[:20] + ["CONTACT", "Email: jane.doe@example.org"] + filler[20:]])
+
+
+def test_email_question_retrieves_chunk_with_address_despite_cutoff(
+    tmp_path, chroma_service, embedding_service, fake_llm
+):
+    # A cutoff that excludes every chunk by distance: only the text match can find it.
+    client = authenticated_client(make_app(
+        tmp_path, chroma_service, embedding_service, fake_llm, RETRIEVAL_MAX_DISTANCE=-1.0
+    ))
+    upload(client, _cv_pdf(), filename="cv.pdf")
+
+    assert ask(client, question="what is my mail id").status_code == 200
+    _, human = fake_llm.last_prompt
+    assert "jane.doe@example.org" in human.content
+
+
+@pytest.mark.parametrize("llm_answer", [
+    "Your email ID is test@gmail.com [Source 1].",       # invented
+    "Your email ID is jane.d@example.org [Source 1].",   # garbled while copying
+    "Your email ID is jane.doe @example.org",            # split by a space
+    "The information is not available in the uploaded documents.",
+])
+def test_email_answer_is_rebuilt_from_context(tmp_path, chroma_service, embedding_service, llm_answer):
+    llm = RecordingFakeLLM(responses=[llm_answer])
+    client = authenticated_client(make_app(tmp_path, chroma_service, embedding_service, llm))
+    upload(client, _cv_pdf(), filename="cv.pdf")
+
+    answer = ask(client, question="what is my mailid").get_json()["answer"]
+    assert answer.startswith("The email address in the uploaded documents is jane.doe@example.org [Source ")
+
+
+def test_invented_email_without_one_in_context_is_rejected(chat_client, sample_pdf_bytes, fake_llm):
+    fake_llm.responses = ["Write to test@gmail.com for the procedure."]
+    upload(chat_client, sample_pdf_bytes)
+
+    answer = ask(chat_client, question="What is the procedure?").get_json()["answer"]
+    assert answer == "The information is not available in the uploaded documents."
+
+
+def test_answer_with_email_from_context_is_kept(tmp_path, chroma_service, embedding_service):
+    llm = RecordingFakeLLM(responses=["Your email ID is Jane.Doe@example.org [Source 1]."])
+    client = authenticated_client(make_app(tmp_path, chroma_service, embedding_service, llm))
+    upload(client, _cv_pdf(), filename="cv.pdf")
+
+    body = ask(client, question="what is my email id?").get_json()
+    assert body["answer"] == "Your email ID is Jane.Doe@example.org [Source 1]."
 
 
 # --- Infrastructure errors ----------------------------------------------------
